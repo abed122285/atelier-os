@@ -10,11 +10,11 @@ const buckets = new Map<string, RateLimitBucket>();
 
 function pruneExpiredBuckets(now: number) {
   if (buckets.size < MAX_TRACKED_KEYS) return;
-  for (const [key, entry] of buckets.entries()) {
+  buckets.forEach((entry, key) => {
     if (now > entry.resetAt) {
       buckets.delete(key);
     }
-  }
+  });
   // If still full, evict oldest inserted key
   if (buckets.size >= MAX_TRACKED_KEYS) {
     const oldestKey = buckets.keys().next().value;
