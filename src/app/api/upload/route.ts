@@ -1,47 +1,65 @@
 import { NextRequest, NextResponse } from "next/server";
-import { saveUploadedImage } from "@/lib/storage";
+import { saveUploadedImage, verifyImageMagicBytes } from "@/lib/storage";
+import { requirePermission } from "@/lib/auth";
+import { PermissionCode } from "@/lib/rbac";
+import { enforceRateLimit } from "@/lib/rateLimit";
+import { MAX_IMAGE_SIZE_BYTES } from "@/lib/validators";
 import { db } from "@/db";
 import { attachments, activityLogs } from "@/db/schema";
 
 const ALLOWED_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
-const MAX_UPLOAD_BYTES = 5 * 1024 * 1024; // 5 MB
+const MAX_UPLOAD_BYTES = MAX_IMAGE_SIZE_BYTES; // 5 MB
 
-export function verifyImageMagicBytes(buf: Uint8Array, declaredMime: string): boolean {
-  if (buf.length < 12) return false;
-  // PNG: 89 50 4E 47 0D 0A 1A 0A
-  if (declaredMime === "image/png") {
-    return buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47;
-  }
-  // JPEG: FF D8 FF
-  if (declaredMime === "image/jpeg") {
-    return buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff;
-  }
-  // WEBP: RIFF....WEBP
-  if (declaredMime === "image/webp") {
-    return (
-      buf[0] === 0x52 &&
-      buf[1] === 0x49 &&
-      buf[2] === 0x46 &&
-      buf[3] === 0x46 &&
-      buf[8] === 0x57 &&
-      buf[9] === 0x45 &&
-      buf[10] === 0x42 &&
-      buf[11] === 0x50
-    );
-  }
-  return false;
-}
+const ENTITY_UPLOAD_PERMISSION: Record<string, PermissionCode> = {
+  MATERIAL: "inventory.adjust",
+  PURCHASE: "purchases.create",
+  MODEL: "models.create",
+  PRODUCTION_ORDER: "production.update",
+  FINISHED_PRODUCT: "production.update",
+  SALE: "sales.create",
+  INVOICE: "invoices.create",
+  EXPENSE: "finance.create_expense",
+  SETTINGS: "settings.manage",
+};
+
+export { verifyImageMagicBytes };
 
 export function sanitizeEntityName(raw: string): string {
   return raw.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 48) || "MATERIAL";
 }
 
 export async function POST(req: NextRequest) {
+  const rateLimitResponse = enforceRateLimit(req, {
+    namespace: "api:upload:post",
+    maxRequests: 20,
+    windowMs: 10 * 60 * 1000,
+  });
+  if (rateLimitResponse) return rateLimitResponse;
+
   try {
+    const contentLength = Number(req.headers.get("content-length") || 0);
+    if (contentLength > MAX_UPLOAD_BYTES + 64 * 1024) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: { code: "PAYLOAD_TOO_LARGE", message: "File exceeds 5MB maximum limit" },
+        },
+        { status: 413 }
+      );
+    }
+
     const formData = await req.formData();
     const file = formData.get("file") as File | null;
-    const entityType = sanitizeEntityName((formData.get("entityType") as string) || "MATERIAL");
+    const entityType = sanitizeEntityName((formData.get("entityType") as string) || "MATERIAL").toUpperCase();
     const entityId = sanitizeEntityName((formData.get("entityId") as string) || "UNASSIGNED");
+
+    const requiredPerm: PermissionCode =
+      ENTITY_UPLOAD_PERMISSION[entityType] || "inventory.adjust";
+
+    const auth = await requirePermission(req, requiredPerm);
+    if (!auth.ok) {
+      return auth.response;
+    }
 
     if (!file) {
       return NextResponse.json(
@@ -55,7 +73,7 @@ export async function POST(req: NextRequest) {
           ok: false,
           error: {
             code: "UNSUPPORTED_MEDIA_TYPE",
-            message: `Unsupported image type: ${file.type}. Allowed: PNG, JPG, WEBP.`,
+            message: "Unsupported image type. Allowed: PNG, JPG, WEBP.",
           },
         },
         { status: 415 }
@@ -95,9 +113,9 @@ export async function POST(req: NextRequest) {
           entityType,
           entityId,
           fileName: saved.fileName,
-          fileUrl: saved.publicUrl,
+          url: saved.url,
           mimeType: saved.mimeType,
-          fileSize: saved.sizeBytes,
+          sizeBytes: saved.sizeBytes,
         })
         .returning();
       attachmentRecord = inserted;
@@ -115,16 +133,16 @@ export async function POST(req: NextRequest) {
         entityType,
         entityId,
         fileName: saved.fileName,
-        fileUrl: saved.publicUrl,
+        url: saved.url,
         mimeType: saved.mimeType,
-        fileSize: saved.sizeBytes,
+        sizeBytes: saved.sizeBytes,
       };
     }
 
     return NextResponse.json({ ok: true, data: attachmentRecord }, { status: 201 });
-  } catch (err: any) {
+  } catch {
     return NextResponse.json(
-      { ok: false, error: { code: "UPLOAD_FAILED", message: err?.message || "Image upload failed" } },
+      { ok: false, error: { code: "UPLOAD_FAILED", message: "Image upload could not be processed" } },
       { status: 500 }
     );
   }

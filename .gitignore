@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Next.js build output
+.next/
+out/
+build/
+dist/
+
+# Environment variables & secrets (keep only .env.example)
+.env
+.env.*
+!.env.example
+
+# Local databases & backups
+*.db
+*.sqlite
+*.sqlite3
+*.dump
+backups/
+public/uploads/
+
+# TypeScript & OS artifacts
+*.tsbuildinfo
+next-env.d.ts
+.DS_Store
+Thumbs.db

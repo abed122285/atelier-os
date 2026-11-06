@@ -2,9 +2,11 @@ import { drizzle } from "drizzle-orm/postgres-js";
 import postgres from "postgres";
 import * as schema from "./schema";
 
-const connectionString =
-  process.env.DATABASE_URL || "postgresql://postgres:postgres@localhost:5432/atelier_os";
+const connectionString = process.env.DATABASE_URL;
+if (!connectionString) {
+  throw new Error("Missing required DATABASE_URL environment variable");
+}
 
-const queryClient = postgres(connectionString, { max: 10 });
+const queryClient = postgres(connectionString, { max: 10, prepare: false });
 export const db = drizzle(queryClient, { schema });
 export type Database = typeof db;

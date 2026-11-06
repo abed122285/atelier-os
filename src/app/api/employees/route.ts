@@ -1,69 +1,97 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
-import { createSupabaseServerClient, createSupabaseServiceRoleClient } from "@/lib/supabase/server";
+import { createSupabaseServiceRoleClient } from "@/lib/supabase/server";
+import { requirePermission } from "@/lib/auth";
+import { enforceRateLimit } from "@/lib/rateLimit";
+import {
+  ALL_PERMISSIONS,
+  ASSIGNABLE_EMPLOYEE_ROLES,
+  AtelierSessionUser,
+  evaluateUserPermission,
+  PermissionCode,
+  ROLE_PERMISSION_PRESETS,
+} from "@/lib/rbac";
+
+const PermissionEnum = z.enum(ALL_PERMISSIONS);
+const RoleCodeEnum = z.enum(ASSIGNABLE_EMPLOYEE_ROLES);
 
 const CreateEmployeeSchema = z.object({
   username: z.string().trim().min(3).max(48).regex(/^[a-zA-Z0-9._-]+$/),
   password: z.string().min(10).max(128),
   fullName: z.string().min(2).max(120),
-  roleCode: z.enum(["PRODUCTION_MANAGER", "SALES_CASHIER", "INVENTORY_PURCHASING", "ACCOUNTANT_FINANCE"]),
+  roleCode: RoleCodeEnum,
   jobTitleAr: z.string().max(120).optional().default(""),
   jobTitleFr: z.string().max(120).optional().default(""),
   phone: z.string().max(40).optional().default(""),
-  customPermissionsGrant: z.array(z.string()).optional().default([]),
-  customPermissionsDeny: z.array(z.string()).optional().default([]),
+  customPermissionsGrant: z.array(PermissionEnum).optional().default([]),
+  customPermissionsDeny: z.array(PermissionEnum).optional().default([]),
 });
 
 const UpdateEmployeeAccessSchema = z.object({
   employeeId: z.string().uuid(),
   isActive: z.boolean().optional(),
   revokeSessions: z.boolean().optional(),
-  roleCode: z.string().optional(),
-  customPermissionsGrant: z.array(z.string()).optional(),
-  customPermissionsDeny: z.array(z.string()).optional(),
+  roleCode: RoleCodeEnum.optional(),
+  customPermissionsGrant: z.array(PermissionEnum).optional(),
+  customPermissionsDeny: z.array(PermissionEnum).optional(),
 });
 
-async function verifyCallerCanManageEmployees() {
-  const supabase = createSupabaseServerClient();
-  const { data: { user } } = await supabase.auth.getUser();
-  if (!user) return null;
-
-  const { data: profile } = await supabase
-    .from("profiles")
-    .select("id, organization_id, username, account_type, is_active")
-    .eq("id", user.id)
-    .maybeSingle();
-
-  if (!profile || !profile.is_active) return null;
-  if (profile.account_type === "OWNER") return profile;
-
-  const { data: hasPerm } = await supabase.rpc("has_atelier_permission" as any, {
-    target_org_id: profile.organization_id,
-    required_perm: "employees.manage",
-  });
-  return hasPerm ? profile : null;
+/**
+ * Prevents privilege escalation: a non-Owner manager cannot assign a role or custom permission
+ * that contains permissions the caller does not personally hold.
+ */
+function callerHoldsAllTargetPermissions(
+  caller: AtelierSessionUser,
+  roleCode?: string,
+  customGrant?: PermissionCode[]
+): boolean {
+  if (caller.accountType === "OWNER" || caller.roleCode === "OWNER_ADMIN") {
+    return true;
+  }
+  const rolePerms = roleCode ? ROLE_PERMISSION_PRESETS[roleCode] || [] : [];
+  const requestedPerms = [...rolePerms, ...(customGrant || [])];
+  return requestedPerms.every((perm) => evaluateUserPermission(caller, perm));
 }
 
 export async function POST(req: NextRequest) {
+  const rateLimitResponse = enforceRateLimit(req, {
+    namespace: "api:employees:post",
+    maxRequests: 15,
+    windowMs: 10 * 60 * 1000,
+  });
+  if (rateLimitResponse) return rateLimitResponse;
+
   try {
-    const caller = await verifyCallerCanManageEmployees();
-    if (!caller) {
-      return NextResponse.json(
-        { ok: false, error: { code: "FORBIDDEN", message: "Only the Owner or authorized administrators can manage employee accounts" } },
-        { status: 403 }
-      );
+    const auth = await requirePermission(req, "employees.manage");
+    if (!auth.ok) {
+      return auth.response;
     }
+    const caller = auth.user;
 
     const body = await req.json();
     const parsed = CreateEmployeeSchema.safeParse(body);
     if (!parsed.success) {
       return NextResponse.json(
-        { ok: false, error: { code: "VALIDATION_ERROR", message: "Invalid employee payload", details: parsed.error.flatten() } },
+        { ok: false, error: { code: "VALIDATION_ERROR", message: "Invalid employee payload" } },
         { status: 422 }
       );
     }
 
     const data = parsed.data;
+
+    if (!callerHoldsAllTargetPermissions(caller, data.roleCode, data.customPermissionsGrant)) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: {
+            code: "PRIVILEGE_ESCALATION_BLOCKED",
+            message: "Cannot grant permissions or roles that exceed your own permission set",
+          },
+        },
+        { status: 403 }
+      );
+    }
+
     const uname = data.username.toLowerCase();
     const internalEmail = `${uname}@atelier.afafelassli.dz`;
     const admin = createSupabaseServiceRoleClient();
@@ -77,12 +105,13 @@ export async function POST(req: NextRequest) {
         username: uname,
         full_name: data.fullName,
         account_type: "EMPLOYEE",
+        session_version: 1,
       },
     });
 
     if (authErr || !createdAuth.user) {
       return NextResponse.json(
-        { ok: false, error: { code: "CREATE_AUTH_FAILED", message: authErr?.message || "Failed to create employee credentials" } },
+        { ok: false, error: { code: "CREATE_AUTH_FAILED", message: "Failed to create employee credentials" } },
         { status: 409 }
       );
     }
@@ -91,18 +120,21 @@ export async function POST(req: NextRequest) {
     const { data: roleRecord } = await admin
       .from("roles")
       .select("id")
-      .eq("organization_id", caller.organization_id)
+      .eq("organization_id", caller.organizationId)
       .eq("code", data.roleCode)
       .single();
 
     if (!roleRecord) {
-      throw new Error(`Role ${data.roleCode} not found`);
+      return NextResponse.json(
+        { ok: false, error: { code: "ROLE_NOT_FOUND", message: "Specified role does not exist" } },
+        { status: 400 }
+      );
     }
 
     // 2. Create Profile, Membership & Role Assignment (Employee can NEVER be created as OWNER)
     await admin.from("profiles").insert({
       id: empId,
-      organization_id: caller.organization_id,
+      organization_id: caller.organizationId,
       username: uname,
       internal_auth_email: internalEmail,
       full_name: data.fullName,
@@ -115,14 +147,14 @@ export async function POST(req: NextRequest) {
     });
 
     await admin.from("memberships").insert({
-      organization_id: caller.organization_id,
+      organization_id: caller.organizationId,
       user_id: empId,
       is_owner: false,
       status: "ACTIVE",
     });
 
     await admin.from("user_role_assignments").insert({
-      organization_id: caller.organization_id,
+      organization_id: caller.organizationId,
       user_id: empId,
       role_id: roleRecord.id,
       custom_permissions_grant: data.customPermissionsGrant,
@@ -131,10 +163,10 @@ export async function POST(req: NextRequest) {
     });
 
     await admin.from("audit_logs").insert({
-      organization_id: caller.organization_id,
+      organization_id: caller.organizationId,
       actor_user_id: caller.id,
       actor_username: caller.username,
-      actor_role: caller.account_type,
+      actor_role: caller.accountType,
       event_category: "RBAC",
       action_code: "EMPLOYEE_CREATED",
       entity_type: "PROFILE",
@@ -147,23 +179,28 @@ export async function POST(req: NextRequest) {
       { ok: true, employee: { id: empId, username: uname, fullName: data.fullName, roleCode: data.roleCode, isActive: true } },
       { status: 201 }
     );
-  } catch (err: any) {
+  } catch {
     return NextResponse.json(
-      { ok: false, error: { code: "SERVER_ERROR", message: err?.message || "Failed to create employee" } },
+      { ok: false, error: { code: "SERVER_ERROR", message: "Failed to create employee" } },
       { status: 500 }
     );
   }
 }
 
 export async function PATCH(req: NextRequest) {
+  const rateLimitResponse = enforceRateLimit(req, {
+    namespace: "api:employees:patch",
+    maxRequests: 15,
+    windowMs: 10 * 60 * 1000,
+  });
+  if (rateLimitResponse) return rateLimitResponse;
+
   try {
-    const caller = await verifyCallerCanManageEmployees();
-    if (!caller) {
-      return NextResponse.json(
-        { ok: false, error: { code: "FORBIDDEN", message: "Unauthorized" } },
-        { status: 403 }
-      );
+    const auth = await requirePermission(req, "employees.manage");
+    if (!auth.ok) {
+      return auth.response;
     }
+    const caller = auth.user;
 
     const body = await req.json();
     const parsed = UpdateEmployeeAccessSchema.safeParse(body);
@@ -174,7 +211,36 @@ export async function PATCH(req: NextRequest) {
       );
     }
 
-    const { employeeId, isActive, revokeSessions, customPermissionsGrant, customPermissionsDeny } = parsed.data;
+    const { employeeId, isActive, revokeSessions, roleCode, customPermissionsGrant, customPermissionsDeny } =
+      parsed.data;
+
+    // Prevent non-Owner administrators from modifying their own permissions or escalating privileges
+    if (caller.accountType !== "OWNER" && employeeId === caller.id) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: {
+            code: "SELF_MODIFICATION_FORBIDDEN",
+            message: "Non-owner administrators cannot modify their own role or permission grants",
+          },
+        },
+        { status: 403 }
+      );
+    }
+
+    if (!callerHoldsAllTargetPermissions(caller, roleCode, customPermissionsGrant)) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: {
+            code: "PRIVILEGE_ESCALATION_BLOCKED",
+            message: "Cannot grant permissions or roles that exceed your own permission set",
+          },
+        },
+        { status: 403 }
+      );
+    }
+
     const admin = createSupabaseServiceRoleClient();
 
     // Prevent modifying Owner account status or self-lockout
@@ -182,7 +248,7 @@ export async function PATCH(req: NextRequest) {
       .from("profiles")
       .select("id, username, account_type, session_version")
       .eq("id", employeeId)
-      .eq("organization_id", caller.organization_id)
+      .eq("organization_id", caller.organizationId)
       .single();
 
     if (!targetProfile || targetProfile.account_type === "OWNER") {
@@ -192,7 +258,10 @@ export async function PATCH(req: NextRequest) {
       );
     }
 
-    const nextSessionVersion = revokeSessions || isActive === false ? targetProfile.session_version + 1 : targetProfile.session_version;
+    const nextSessionVersion =
+      revokeSessions || isActive === false || roleCode || customPermissionsGrant || customPermissionsDeny
+        ? targetProfile.session_version + 1
+        : targetProfile.session_version;
 
     await admin
       .from("profiles")
@@ -208,19 +277,37 @@ export async function PATCH(req: NextRequest) {
         .from("memberships")
         .update({ status: isActive ? "ACTIVE" : "SUSPENDED", updated_at: new Date().toISOString() })
         .eq("user_id", employeeId)
-        .eq("organization_id", caller.organization_id);
+        .eq("organization_id", caller.organizationId);
     }
 
-    if (customPermissionsGrant || customPermissionsDeny) {
+    if (roleCode || customPermissionsGrant || customPermissionsDeny) {
+      let nextRoleId: string | undefined;
+      if (roleCode) {
+        const { data: roleRecord } = await admin
+          .from("roles")
+          .select("id")
+          .eq("organization_id", caller.organizationId)
+          .eq("code", roleCode)
+          .single();
+        if (!roleRecord) {
+          return NextResponse.json(
+            { ok: false, error: { code: "ROLE_NOT_FOUND", message: "Specified role does not exist" } },
+            { status: 400 }
+          );
+        }
+        nextRoleId = roleRecord.id;
+      }
+
       await admin
         .from("user_role_assignments")
         .update({
+          ...(nextRoleId ? { role_id: nextRoleId } : {}),
           ...(customPermissionsGrant ? { custom_permissions_grant: customPermissionsGrant } : {}),
           ...(customPermissionsDeny ? { custom_permissions_deny: customPermissionsDeny } : {}),
           updated_at: new Date().toISOString(),
         })
         .eq("user_id", employeeId)
-        .eq("organization_id", caller.organization_id);
+        .eq("organization_id", caller.organizationId);
     }
 
     if (revokeSessions || isActive === false) {
@@ -228,10 +315,10 @@ export async function PATCH(req: NextRequest) {
     }
 
     await admin.from("audit_logs").insert({
-      organization_id: caller.organization_id,
+      organization_id: caller.organizationId,
       actor_user_id: caller.id,
       actor_username: caller.username,
-      actor_role: caller.account_type,
+      actor_role: caller.accountType,
       event_category: "RBAC",
       action_code: isActive === false ? "EMPLOYEE_DEACTIVATED" : revokeSessions ? "SESSION_REVOKED" : "PERMISSIONS_UPDATED",
       entity_type: "PROFILE",
@@ -241,9 +328,9 @@ export async function PATCH(req: NextRequest) {
     });
 
     return NextResponse.json({ ok: true, employeeId, isActive, sessionVersion: nextSessionVersion });
-  } catch (err: any) {
+  } catch {
     return NextResponse.json(
-      { ok: false, error: { code: "SERVER_ERROR", message: err?.message || "Failed to update employee" } },
+      { ok: false, error: { code: "SERVER_ERROR", message: "Failed to update employee" } },
       { status: 500 }
     );
   }

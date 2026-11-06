@@ -524,3 +524,390 @@ CREATE TABLE IF NOT EXISTS activity_logs (
   metadata_json TEXT DEFAULT '{}',
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+-- ============================================================================
+-- LAYER 3 DEFENSE-IN-DEPTH: MULTI-TENANT ORGANIZATION SCOPING & RLS POLICIES
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS organizations (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  slug TEXT NOT NULL UNIQUE,
+  name_ar TEXT NOT NULL,
+  name_fr TEXT NOT NULL,
+  currency TEXT NOT NULL DEFAULT 'DZD',
+  timezone TEXT NOT NULL DEFAULT 'Africa/Algiers',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS profiles (
+  id UUID PRIMARY KEY,
+  organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+  username TEXT NOT NULL UNIQUE,
+  internal_auth_email TEXT NOT NULL UNIQUE,
+  full_name TEXT NOT NULL,
+  account_type TEXT NOT NULL CHECK (account_type IN ('OWNER', 'EMPLOYEE')),
+  job_title_ar TEXT DEFAULT '',
+  job_title_fr TEXT DEFAULT '',
+  phone TEXT DEFAULT '',
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  mfa_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+  session_version INTEGER NOT NULL DEFAULT 1,
+  last_login_at TIMESTAMPTZ,
+  created_by UUID,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS memberships (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+  user_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  is_owner BOOLEAN NOT NULL DEFAULT FALSE,
+  status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE', 'SUSPENDED', 'REVOKED')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (organization_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS roles (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+  code TEXT NOT NULL,
+  name_ar TEXT NOT NULL,
+  name_fr TEXT NOT NULL,
+  is_system BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (organization_id, code)
+);
+
+CREATE TABLE IF NOT EXISTS permissions (
+  code TEXT PRIMARY KEY,
+  module TEXT NOT NULL,
+  description_ar TEXT NOT NULL,
+  description_fr TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS role_permissions (
+  role_id UUID NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+  permission_code TEXT NOT NULL REFERENCES permissions(code) ON DELETE CASCADE,
+  PRIMARY KEY (role_id, permission_code)
+);
+
+CREATE TABLE IF NOT EXISTS user_role_assignments (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+  user_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  role_id UUID NOT NULL REFERENCES roles(id) ON DELETE RESTRICT,
+  custom_permissions_grant TEXT[] NOT NULL DEFAULT '{}',
+  custom_permissions_deny TEXT[] NOT NULL DEFAULT '{}',
+  assigned_by UUID,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (organization_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS audit_logs (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+  actor_user_id UUID,
+  actor_username TEXT NOT NULL,
+  actor_role TEXT NOT NULL,
+  event_category TEXT NOT NULL,
+  action_code TEXT NOT NULL,
+  entity_type TEXT NOT NULL,
+  entity_id TEXT NOT NULL,
+  summary_ar TEXT NOT NULL,
+  summary_fr TEXT NOT NULL,
+  ip_address TEXT,
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Ensure multi-tenant organization_id column exists on all 33 operational tables
+ALTER TABLE workshop_settings ADD COLUMN IF NOT EXISTS organization_id UUID REFERENCES organizations(id) ON DELETE CASCADE;
+ALTER TABLE categories ADD COLUMN IF NOT EXISTS organization_id UUID REFERENCES organizations(id) ON DELETE CASCADE;
+ALTER TABLE suppliers ADD COLUMN IF NOT EXISTS organization_id UUID REFERENCES organizations(id) ON DELETE CASCADE;
+ALTER TABLE materials ADD COLUMN IF NOT EXISTS organization_id UUID REFERENCES organizations(id) ON DELETE CASCADE;
+ALTER TABLE material_images ADD COLUMN IF NOT EXISTS organization_id UUID REFERENCES organizations(id) ON DELETE CASCADE;
+ALTER TABLE material_stock_movements ADD COLUMN IF NOT EXISTS organization_id UUID REFERENCES organizations(id) ON DELETE CASCADE;
+ALTER TABLE purchases ADD COLUMN IF NOT EXISTS organization_id UUID REFERENCES organizations(id) ON DELETE CASCADE;
+ALTER TABLE purchase_items ADD COLUMN IF NOT EXISTS organization_id UUID REFERENCES organizations(id) ON DELETE CASCADE;
+ALTER TABLE supplier_payments ADD COLUMN IF NOT EXISTS organization_id UUID REFERENCES organizations(id) ON DELETE CASCADE;
+ALTER TABLE models ADD COLUMN IF NOT EXISTS organization_id UUID REFERENCES organizations(id) ON DELETE CASCADE;
+ALTER TABLE model_images ADD COLUMN IF NOT EXISTS organization_id UUID REFERENCES organizations(id) ON DELETE CASCADE;
+ALTER TABLE model_variants ADD COLUMN IF NOT EXISTS organization_id UUID REFERENCES organizations(id) ON DELETE CASCADE;
+ALTER TABLE bill_of_materials ADD COLUMN IF NOT EXISTS organization_id UUID REFERENCES organizations(id) ON DELETE CASCADE;
+ALTER TABLE bill_of_material_items ADD COLUMN IF NOT EXISTS organization_id UUID REFERENCES organizations(id) ON DELETE CASCADE;
+ALTER TABLE production_stages ADD COLUMN IF NOT EXISTS organization_id UUID REFERENCES organizations(id) ON DELETE CASCADE;
+ALTER TABLE production_orders ADD COLUMN IF NOT EXISTS organization_id UUID REFERENCES organizations(id) ON DELETE CASCADE;
+ALTER TABLE production_order_stages ADD COLUMN IF NOT EXISTS organization_id UUID REFERENCES organizations(id) ON DELETE CASCADE;
+ALTER TABLE production_consumptions ADD COLUMN IF NOT EXISTS organization_id UUID REFERENCES organizations(id) ON DELETE CASCADE;
+ALTER TABLE quality_checks ADD COLUMN IF NOT EXISTS organization_id UUID REFERENCES organizations(id) ON DELETE CASCADE;
+ALTER TABLE finished_products ADD COLUMN IF NOT EXISTS organization_id UUID REFERENCES organizations(id) ON DELETE CASCADE;
+ALTER TABLE finished_product_images ADD COLUMN IF NOT EXISTS organization_id UUID REFERENCES organizations(id) ON DELETE CASCADE;
+ALTER TABLE finished_stock_movements ADD COLUMN IF NOT EXISTS organization_id UUID REFERENCES organizations(id) ON DELETE CASCADE;
+ALTER TABLE customers ADD COLUMN IF NOT EXISTS organization_id UUID REFERENCES organizations(id) ON DELETE CASCADE;
+ALTER TABLE sales ADD COLUMN IF NOT EXISTS organization_id UUID REFERENCES organizations(id) ON DELETE CASCADE;
+ALTER TABLE sale_items ADD COLUMN IF NOT EXISTS organization_id UUID REFERENCES organizations(id) ON DELETE CASCADE;
+ALTER TABLE invoices ADD COLUMN IF NOT EXISTS organization_id UUID REFERENCES organizations(id) ON DELETE CASCADE;
+ALTER TABLE invoice_items ADD COLUMN IF NOT EXISTS organization_id UUID REFERENCES organizations(id) ON DELETE CASCADE;
+ALTER TABLE payments ADD COLUMN IF NOT EXISTS organization_id UUID REFERENCES organizations(id) ON DELETE CASCADE;
+ALTER TABLE refunds ADD COLUMN IF NOT EXISTS organization_id UUID REFERENCES organizations(id) ON DELETE CASCADE;
+ALTER TABLE expenses ADD COLUMN IF NOT EXISTS organization_id UUID REFERENCES organizations(id) ON DELETE CASCADE;
+ALTER TABLE cash_movements ADD COLUMN IF NOT EXISTS organization_id UUID REFERENCES organizations(id) ON DELETE CASCADE;
+ALTER TABLE attachments ADD COLUMN IF NOT EXISTS organization_id UUID REFERENCES organizations(id) ON DELETE CASCADE;
+ALTER TABLE activity_logs ADD COLUMN IF NOT EXISTS organization_id UUID REFERENCES organizations(id) ON DELETE CASCADE;
+
+-- Server-side RBAC helper functions for PostgreSQL RLS enforcement
+CREATE OR REPLACE FUNCTION public.is_org_member(target_org_id UUID)
+RETURNS BOOLEAN
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT EXISTS (
+    SELECT 1
+    FROM public.memberships m
+    JOIN public.profiles p ON p.id = m.user_id
+    WHERE m.organization_id = target_org_id
+      AND m.user_id = auth.uid()
+      AND m.status = 'ACTIVE'
+      AND p.is_active = TRUE
+  );
+$$;
+
+CREATE OR REPLACE FUNCTION public.is_org_owner(target_org_id UUID)
+RETURNS BOOLEAN
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT EXISTS (
+    SELECT 1
+    FROM public.memberships m
+    JOIN public.profiles p ON p.id = m.user_id
+    WHERE m.organization_id = target_org_id
+      AND m.user_id = auth.uid()
+      AND m.status = 'ACTIVE'
+      AND m.is_owner = TRUE
+      AND p.account_type = 'OWNER'
+      AND p.is_active = TRUE
+  );
+$$;
+
+CREATE OR REPLACE FUNCTION public.has_atelier_permission(target_org_id UUID, required_perm TEXT)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_is_owner BOOLEAN;
+  v_granted BOOLEAN := FALSE;
+BEGIN
+  IF auth.uid() IS NULL OR target_org_id IS NULL THEN
+    RETURN FALSE;
+  END IF;
+
+  SELECT public.is_org_owner(target_org_id) INTO v_is_owner;
+  IF v_is_owner THEN
+    RETURN TRUE;
+  END IF;
+
+  IF NOT public.is_org_member(target_org_id) THEN
+    RETURN FALSE;
+  END IF;
+
+  SELECT
+    CASE
+      WHEN required_perm = ANY(ura.custom_permissions_deny) THEN FALSE
+      WHEN required_perm = ANY(ura.custom_permissions_grant) THEN TRUE
+      ELSE EXISTS (
+        SELECT 1
+        FROM public.role_permissions rp
+        WHERE rp.role_id = ura.role_id
+          AND rp.permission_code = required_perm
+      )
+    END
+  INTO v_granted
+  FROM public.user_role_assignments ura
+  WHERE ura.organization_id = target_org_id
+    AND ura.user_id = auth.uid();
+
+  RETURN COALESCE(v_granted, FALSE);
+END;
+$$;
+
+-- Enable Row-Level Security on ALL 41 tables (33 operational + 8 RBAC/tenancy tables)
+ALTER TABLE organizations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE profiles ENABLE ROW LEVEL SECURITY;
+ALTER TABLE memberships ENABLE ROW LEVEL SECURITY;
+ALTER TABLE roles ENABLE ROW LEVEL SECURITY;
+ALTER TABLE permissions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE role_permissions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE user_role_assignments ENABLE ROW LEVEL SECURITY;
+ALTER TABLE audit_logs ENABLE ROW LEVEL SECURITY;
+
+ALTER TABLE workshop_settings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE categories ENABLE ROW LEVEL SECURITY;
+ALTER TABLE suppliers ENABLE ROW LEVEL SECURITY;
+ALTER TABLE materials ENABLE ROW LEVEL SECURITY;
+ALTER TABLE material_images ENABLE ROW LEVEL SECURITY;
+ALTER TABLE material_stock_movements ENABLE ROW LEVEL SECURITY;
+ALTER TABLE purchases ENABLE ROW LEVEL SECURITY;
+ALTER TABLE purchase_items ENABLE ROW LEVEL SECURITY;
+ALTER TABLE supplier_payments ENABLE ROW LEVEL SECURITY;
+ALTER TABLE models ENABLE ROW LEVEL SECURITY;
+ALTER TABLE model_images ENABLE ROW LEVEL SECURITY;
+ALTER TABLE model_variants ENABLE ROW LEVEL SECURITY;
+ALTER TABLE bill_of_materials ENABLE ROW LEVEL SECURITY;
+ALTER TABLE bill_of_material_items ENABLE ROW LEVEL SECURITY;
+ALTER TABLE production_stages ENABLE ROW LEVEL SECURITY;
+ALTER TABLE production_orders ENABLE ROW LEVEL SECURITY;
+ALTER TABLE production_order_stages ENABLE ROW LEVEL SECURITY;
+ALTER TABLE production_consumptions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE quality_checks ENABLE ROW LEVEL SECURITY;
+ALTER TABLE finished_products ENABLE ROW LEVEL SECURITY;
+ALTER TABLE finished_product_images ENABLE ROW LEVEL SECURITY;
+ALTER TABLE finished_stock_movements ENABLE ROW LEVEL SECURITY;
+ALTER TABLE customers ENABLE ROW LEVEL SECURITY;
+ALTER TABLE sales ENABLE ROW LEVEL SECURITY;
+ALTER TABLE sale_items ENABLE ROW LEVEL SECURITY;
+ALTER TABLE invoices ENABLE ROW LEVEL SECURITY;
+ALTER TABLE invoice_items ENABLE ROW LEVEL SECURITY;
+ALTER TABLE payments ENABLE ROW LEVEL SECURITY;
+ALTER TABLE refunds ENABLE ROW LEVEL SECURITY;
+ALTER TABLE expenses ENABLE ROW LEVEL SECURITY;
+ALTER TABLE cash_movements ENABLE ROW LEVEL SECURITY;
+ALTER TABLE attachments ENABLE ROW LEVEL SECURITY;
+ALTER TABLE activity_logs ENABLE ROW LEVEL SECURITY;
+
+-- Tenant & Permission-Scoped RLS Policies
+CREATE POLICY org_member_select_organizations ON organizations FOR SELECT USING (public.is_org_member(id));
+CREATE POLICY org_owner_modify_organizations ON organizations FOR ALL USING (public.is_org_owner(id)) WITH CHECK (public.is_org_owner(id));
+
+CREATE POLICY org_member_select_profiles ON profiles FOR SELECT USING (public.is_org_member(organization_id));
+CREATE POLICY org_manage_profiles ON profiles FOR ALL USING (public.has_atelier_permission(organization_id, 'employees.manage')) WITH CHECK (public.has_atelier_permission(organization_id, 'employees.manage'));
+
+CREATE POLICY org_member_select_memberships ON memberships FOR SELECT USING (public.is_org_member(organization_id));
+CREATE POLICY org_manage_memberships ON memberships FOR ALL USING (public.has_atelier_permission(organization_id, 'employees.manage')) WITH CHECK (public.has_atelier_permission(organization_id, 'employees.manage'));
+
+CREATE POLICY org_member_select_roles ON roles FOR SELECT USING (public.is_org_member(organization_id));
+CREATE POLICY org_owner_manage_roles ON roles FOR ALL USING (public.is_org_owner(organization_id)) WITH CHECK (public.is_org_owner(organization_id));
+
+CREATE POLICY authenticated_select_permissions ON permissions FOR SELECT USING (auth.uid() IS NOT NULL);
+CREATE POLICY authenticated_select_role_permissions ON role_permissions FOR SELECT USING (auth.uid() IS NOT NULL);
+
+CREATE POLICY org_member_select_role_assignments ON user_role_assignments FOR SELECT USING (public.is_org_member(organization_id));
+CREATE POLICY org_manage_role_assignments ON user_role_assignments FOR ALL USING (public.has_atelier_permission(organization_id, 'employees.manage')) WITH CHECK (public.has_atelier_permission(organization_id, 'employees.manage'));
+
+CREATE POLICY org_select_audit_logs ON audit_logs FOR SELECT USING (public.has_atelier_permission(organization_id, 'reports.view') OR public.is_org_owner(organization_id));
+CREATE POLICY org_insert_audit_logs ON audit_logs FOR INSERT WITH CHECK (public.is_org_member(organization_id));
+
+CREATE POLICY rls_workshop_settings_select ON workshop_settings FOR SELECT USING (public.has_atelier_permission(organization_id, 'dashboard.view'));
+CREATE POLICY rls_workshop_settings_modify ON workshop_settings FOR ALL USING (public.has_atelier_permission(organization_id, 'settings.manage')) WITH CHECK (public.has_atelier_permission(organization_id, 'settings.manage'));
+
+CREATE POLICY rls_categories_select ON categories FOR SELECT USING (public.has_atelier_permission(organization_id, 'dashboard.view'));
+CREATE POLICY rls_categories_modify ON categories FOR ALL USING (public.has_atelier_permission(organization_id, 'inventory.adjust') OR public.has_atelier_permission(organization_id, 'models.create')) WITH CHECK (public.has_atelier_permission(organization_id, 'inventory.adjust') OR public.has_atelier_permission(organization_id, 'models.create'));
+
+CREATE POLICY rls_suppliers_select ON suppliers FOR SELECT USING (public.has_atelier_permission(organization_id, 'purchases.view'));
+CREATE POLICY rls_suppliers_modify ON suppliers FOR ALL USING (public.has_atelier_permission(organization_id, 'purchases.create')) WITH CHECK (public.has_atelier_permission(organization_id, 'purchases.create'));
+
+CREATE POLICY rls_materials_select ON materials FOR SELECT USING (public.has_atelier_permission(organization_id, 'inventory.view'));
+CREATE POLICY rls_materials_modify ON materials FOR ALL USING (public.has_atelier_permission(organization_id, 'inventory.adjust')) WITH CHECK (public.has_atelier_permission(organization_id, 'inventory.adjust'));
+
+CREATE POLICY rls_material_images_select ON material_images FOR SELECT USING (public.has_atelier_permission(organization_id, 'inventory.view'));
+CREATE POLICY rls_material_images_modify ON material_images FOR ALL USING (public.has_atelier_permission(organization_id, 'inventory.adjust')) WITH CHECK (public.has_atelier_permission(organization_id, 'inventory.adjust'));
+
+CREATE POLICY rls_material_movements_select ON material_stock_movements FOR SELECT USING (public.has_atelier_permission(organization_id, 'inventory.view'));
+CREATE POLICY rls_material_movements_insert ON material_stock_movements FOR INSERT WITH CHECK (public.has_atelier_permission(organization_id, 'inventory.adjust') OR public.has_atelier_permission(organization_id, 'purchases.create') OR public.has_atelier_permission(organization_id, 'production.update'));
+
+CREATE POLICY rls_purchases_select ON purchases FOR SELECT USING (public.has_atelier_permission(organization_id, 'purchases.view'));
+CREATE POLICY rls_purchases_modify ON purchases FOR ALL USING (public.has_atelier_permission(organization_id, 'purchases.create')) WITH CHECK (public.has_atelier_permission(organization_id, 'purchases.create'));
+
+CREATE POLICY rls_purchase_items_select ON purchase_items FOR SELECT USING (public.has_atelier_permission(organization_id, 'purchases.view'));
+CREATE POLICY rls_purchase_items_modify ON purchase_items FOR ALL USING (public.has_atelier_permission(organization_id, 'purchases.create')) WITH CHECK (public.has_atelier_permission(organization_id, 'purchases.create'));
+
+CREATE POLICY rls_supplier_payments_select ON supplier_payments FOR SELECT USING (public.has_atelier_permission(organization_id, 'purchases.view') OR public.has_atelier_permission(organization_id, 'finance.view'));
+CREATE POLICY rls_supplier_payments_insert ON supplier_payments FOR INSERT WITH CHECK (public.has_atelier_permission(organization_id, 'purchases.create'));
+
+CREATE POLICY rls_models_select ON models FOR SELECT USING (public.has_atelier_permission(organization_id, 'models.view'));
+CREATE POLICY rls_models_insert ON models FOR INSERT WITH CHECK (public.has_atelier_permission(organization_id, 'models.create'));
+CREATE POLICY rls_models_update ON models FOR UPDATE USING (public.has_atelier_permission(organization_id, 'models.edit') OR public.has_atelier_permission(organization_id, 'models.delete')) WITH CHECK (public.has_atelier_permission(organization_id, 'models.edit') OR public.has_atelier_permission(organization_id, 'models.delete'));
+
+CREATE POLICY rls_model_images_select ON model_images FOR SELECT USING (public.has_atelier_permission(organization_id, 'models.view'));
+CREATE POLICY rls_model_images_modify ON model_images FOR ALL USING (public.has_atelier_permission(organization_id, 'models.create') OR public.has_atelier_permission(organization_id, 'models.edit')) WITH CHECK (public.has_atelier_permission(organization_id, 'models.create') OR public.has_atelier_permission(organization_id, 'models.edit'));
+
+CREATE POLICY rls_model_variants_select ON model_variants FOR SELECT USING (public.has_atelier_permission(organization_id, 'models.view'));
+CREATE POLICY rls_model_variants_modify ON model_variants FOR ALL USING (public.has_atelier_permission(organization_id, 'models.create') OR public.has_atelier_permission(organization_id, 'models.edit')) WITH CHECK (public.has_atelier_permission(organization_id, 'models.create') OR public.has_atelier_permission(organization_id, 'models.edit'));
+
+CREATE POLICY rls_bom_select ON bill_of_materials FOR SELECT USING (public.has_atelier_permission(organization_id, 'models.view') OR public.has_atelier_permission(organization_id, 'production.view'));
+CREATE POLICY rls_bom_modify ON bill_of_materials FOR ALL USING (public.has_atelier_permission(organization_id, 'models.create') OR public.has_atelier_permission(organization_id, 'models.edit')) WITH CHECK (public.has_atelier_permission(organization_id, 'models.create') OR public.has_atelier_permission(organization_id, 'models.edit'));
+
+CREATE POLICY rls_bom_items_select ON bill_of_material_items FOR SELECT USING (public.has_atelier_permission(organization_id, 'models.view') OR public.has_atelier_permission(organization_id, 'production.view'));
+CREATE POLICY rls_bom_items_modify ON bill_of_material_items FOR ALL USING (public.has_atelier_permission(organization_id, 'models.create') OR public.has_atelier_permission(organization_id, 'models.edit')) WITH CHECK (public.has_atelier_permission(organization_id, 'models.create') OR public.has_atelier_permission(organization_id, 'models.edit'));
+
+CREATE POLICY rls_production_stages_select ON production_stages FOR SELECT USING (public.has_atelier_permission(organization_id, 'production.view'));
+CREATE POLICY rls_production_stages_modify ON production_stages FOR ALL USING (public.has_atelier_permission(organization_id, 'settings.manage')) WITH CHECK (public.has_atelier_permission(organization_id, 'settings.manage'));
+
+CREATE POLICY rls_production_orders_select ON production_orders FOR SELECT USING (public.has_atelier_permission(organization_id, 'production.view'));
+CREATE POLICY rls_production_orders_insert ON production_orders FOR INSERT WITH CHECK (public.has_atelier_permission(organization_id, 'production.create'));
+CREATE POLICY rls_production_orders_update ON production_orders FOR UPDATE USING (public.has_atelier_permission(organization_id, 'production.update') OR public.has_atelier_permission(organization_id, 'production.assign')) WITH CHECK (public.has_atelier_permission(organization_id, 'production.update') OR public.has_atelier_permission(organization_id, 'production.assign'));
+
+CREATE POLICY rls_production_order_stages_select ON production_order_stages FOR SELECT USING (public.has_atelier_permission(organization_id, 'production.view'));
+CREATE POLICY rls_production_order_stages_modify ON production_order_stages FOR ALL USING (public.has_atelier_permission(organization_id, 'production.update')) WITH CHECK (public.has_atelier_permission(organization_id, 'production.update'));
+
+CREATE POLICY rls_production_consumptions_select ON production_consumptions FOR SELECT USING (public.has_atelier_permission(organization_id, 'production.view'));
+CREATE POLICY rls_production_consumptions_modify ON production_consumptions FOR ALL USING (public.has_atelier_permission(organization_id, 'production.update')) WITH CHECK (public.has_atelier_permission(organization_id, 'production.update'));
+
+CREATE POLICY rls_quality_checks_select ON quality_checks FOR SELECT USING (public.has_atelier_permission(organization_id, 'production.view'));
+CREATE POLICY rls_quality_checks_modify ON quality_checks FOR ALL USING (public.has_atelier_permission(organization_id, 'production.update')) WITH CHECK (public.has_atelier_permission(organization_id, 'production.update'));
+
+CREATE POLICY rls_finished_products_select ON finished_products FOR SELECT USING (public.has_atelier_permission(organization_id, 'models.view') OR public.has_atelier_permission(organization_id, 'sales.view'));
+CREATE POLICY rls_finished_products_modify ON finished_products FOR ALL USING (public.has_atelier_permission(organization_id, 'production.update') OR public.has_atelier_permission(organization_id, 'sales.create')) WITH CHECK (public.has_atelier_permission(organization_id, 'production.update') OR public.has_atelier_permission(organization_id, 'sales.create'));
+
+CREATE POLICY rls_finished_product_images_select ON finished_product_images FOR SELECT USING (public.has_atelier_permission(organization_id, 'models.view') OR public.has_atelier_permission(organization_id, 'sales.view'));
+CREATE POLICY rls_finished_product_images_modify ON finished_product_images FOR ALL USING (public.has_atelier_permission(organization_id, 'production.update')) WITH CHECK (public.has_atelier_permission(organization_id, 'production.update'));
+
+CREATE POLICY rls_finished_movements_select ON finished_stock_movements FOR SELECT USING (public.has_atelier_permission(organization_id, 'production.view') OR public.has_atelier_permission(organization_id, 'sales.view'));
+CREATE POLICY rls_finished_movements_insert ON finished_stock_movements FOR INSERT WITH CHECK (public.has_atelier_permission(organization_id, 'production.update') OR public.has_atelier_permission(organization_id, 'sales.create') OR public.has_atelier_permission(organization_id, 'sales.cancel'));
+
+CREATE POLICY rls_customers_select ON customers FOR SELECT USING (public.has_atelier_permission(organization_id, 'customers.view'));
+CREATE POLICY rls_customers_insert ON customers FOR INSERT WITH CHECK (public.has_atelier_permission(organization_id, 'customers.create'));
+CREATE POLICY rls_customers_update ON customers FOR UPDATE USING (public.has_atelier_permission(organization_id, 'customers.edit') OR public.has_atelier_permission(organization_id, 'sales.create')) WITH CHECK (public.has_atelier_permission(organization_id, 'customers.edit') OR public.has_atelier_permission(organization_id, 'sales.create'));
+
+CREATE POLICY rls_sales_select ON sales FOR SELECT USING (public.has_atelier_permission(organization_id, 'sales.view'));
+CREATE POLICY rls_sales_insert ON sales FOR INSERT WITH CHECK (public.has_atelier_permission(organization_id, 'sales.create'));
+CREATE POLICY rls_sales_update ON sales FOR UPDATE USING (public.has_atelier_permission(organization_id, 'sales.edit') OR public.has_atelier_permission(organization_id, 'sales.cancel')) WITH CHECK (public.has_atelier_permission(organization_id, 'sales.edit') OR public.has_atelier_permission(organization_id, 'sales.cancel'));
+
+CREATE POLICY rls_sale_items_select ON sale_items FOR SELECT USING (public.has_atelier_permission(organization_id, 'sales.view'));
+CREATE POLICY rls_sale_items_insert ON sale_items FOR INSERT WITH CHECK (public.has_atelier_permission(organization_id, 'sales.create'));
+
+CREATE POLICY rls_invoices_select ON invoices FOR SELECT USING (public.has_atelier_permission(organization_id, 'invoices.view'));
+CREATE POLICY rls_invoices_insert ON invoices FOR INSERT WITH CHECK (public.has_atelier_permission(organization_id, 'invoices.create') OR public.has_atelier_permission(organization_id, 'sales.create'));
+CREATE POLICY rls_invoices_update ON invoices FOR UPDATE USING (public.has_atelier_permission(organization_id, 'invoices.create') OR public.has_atelier_permission(organization_id, 'sales.cancel')) WITH CHECK (public.has_atelier_permission(organization_id, 'invoices.create') OR public.has_atelier_permission(organization_id, 'sales.cancel'));
+
+CREATE POLICY rls_invoice_items_select ON invoice_items FOR SELECT USING (public.has_atelier_permission(organization_id, 'invoices.view'));
+CREATE POLICY rls_invoice_items_insert ON invoice_items FOR INSERT WITH CHECK (public.has_atelier_permission(organization_id, 'invoices.create') OR public.has_atelier_permission(organization_id, 'sales.create'));
+
+CREATE POLICY rls_payments_select ON payments FOR SELECT USING (public.has_atelier_permission(organization_id, 'invoices.view') OR public.has_atelier_permission(organization_id, 'finance.view'));
+CREATE POLICY rls_payments_insert ON payments FOR INSERT WITH CHECK (public.has_atelier_permission(organization_id, 'invoices.create') OR public.has_atelier_permission(organization_id, 'sales.create'));
+
+CREATE POLICY rls_refunds_select ON refunds FOR SELECT USING (public.has_atelier_permission(organization_id, 'invoices.view') OR public.has_atelier_permission(organization_id, 'finance.view'));
+CREATE POLICY rls_refunds_insert ON refunds FOR INSERT WITH CHECK (public.has_atelier_permission(organization_id, 'sales.cancel'));
+
+CREATE POLICY rls_expenses_select ON expenses FOR SELECT USING (public.has_atelier_permission(organization_id, 'finance.view') OR public.has_atelier_permission(organization_id, 'reports.view'));
+CREATE POLICY rls_expenses_insert ON expenses FOR INSERT WITH CHECK (public.has_atelier_permission(organization_id, 'finance.create_expense'));
+
+CREATE POLICY rls_cash_movements_select ON cash_movements FOR SELECT USING (public.has_atelier_permission(organization_id, 'finance.view') OR public.has_atelier_permission(organization_id, 'reports.view'));
+CREATE POLICY rls_cash_movements_insert ON cash_movements FOR INSERT WITH CHECK (public.has_atelier_permission(organization_id, 'finance.create_expense') OR public.has_atelier_permission(organization_id, 'invoices.create') OR public.has_atelier_permission(organization_id, 'sales.create') OR public.has_atelier_permission(organization_id, 'sales.cancel') OR public.has_atelier_permission(organization_id, 'purchases.create'));
+
+CREATE POLICY rls_attachments_select ON attachments FOR SELECT USING (public.is_org_member(organization_id));
+CREATE POLICY rls_attachments_insert ON attachments FOR INSERT WITH CHECK (public.is_org_member(organization_id));
+
+CREATE POLICY rls_activity_logs_select ON activity_logs FOR SELECT USING (public.has_atelier_permission(organization_id, 'reports.view') OR public.is_org_owner(organization_id));
+CREATE POLICY rls_activity_logs_insert ON activity_logs FOR INSERT WITH CHECK (public.is_org_member(organization_id));

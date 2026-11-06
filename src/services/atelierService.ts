@@ -1,4 +1,4 @@
-import { eq, sql } from "drizzle-orm";
+import { eq, desc, sql } from "drizzle-orm";
 import { db } from "@/db";
 import * as schema from "@/db/schema";
 
@@ -102,8 +102,25 @@ export function calculateMovingWeightedAverageCost(
   return roundMoney(totalValue / newTotalQty);
 }
 
+async function computeNextCashBalance(
+  tx: Parameters<Parameters<typeof db.transaction>[0]>[0],
+  direction: "IN" | "OUT",
+  amount: number
+): Promise<number> {
+  const [latest] = await tx
+    .select()
+    .from(schema.cashMovements)
+    .orderBy(desc(schema.cashMovements.createdAt))
+    .limit(1);
+  const currentBalance = latest ? Number(latest.balanceAfter) : 0;
+  const delta = direction === "IN" ? amount : -amount;
+  return roundMoney(currentBalance + delta);
+}
+
 /**
  * PostgreSQL Transactional Mutations via Drizzle ORM
+ * Every financial and stock ledger operation enforces idempotencyKey uniqueness
+ * and uses row-level locking (.for("update")) inside a single database transaction.
  */
 export const AtelierPostgresRepository = {
   async adjustMaterialStock(input: {
@@ -114,10 +131,27 @@ export const AtelierPostgresRepository = {
     reason: string;
   }) {
     return await db.transaction(async (tx) => {
+      const [existingMovement] = await tx
+        .select()
+        .from(schema.materialStockMovements)
+        .where(eq(schema.materialStockMovements.idempotencyKey, input.idempotencyKey))
+        .limit(1);
+
+      if (existingMovement) {
+        return {
+          materialId: existingMovement.materialId,
+          onHandQty: Number(existingMovement.balanceAfterOnHand),
+          availableQty: Number(existingMovement.balanceAfterAvailable),
+          movement: existingMovement,
+          idempotentReplay: true,
+        };
+      }
+
       const [mat] = await tx
         .select()
         .from(schema.materials)
-        .where(eq(schema.materials.id, input.materialId));
+        .where(eq(schema.materials.id, input.materialId))
+        .for("update");
       if (!mat) throw new Error("Material not found");
 
       const onHand = Number(mat.onHandQty);
@@ -203,6 +237,8 @@ export const AtelierPostgresRepository = {
   async receivePurchaseTransaction(input: {
     idempotencyKey: string;
     supplierId: string;
+    shippingCost?: number;
+    discountAmount?: number;
     paidAmount: number;
     paymentMethod: string;
     notes?: string;
@@ -215,11 +251,22 @@ export const AtelierPostgresRepository = {
     }>;
   }) {
     return await db.transaction(async (tx) => {
+      const [existingPurchase] = await tx
+        .select()
+        .from(schema.purchases)
+        .where(eq(schema.purchases.idempotencyKey, input.idempotencyKey))
+        .limit(1);
+      if (existingPurchase) {
+        return existingPurchase;
+      }
+
       let subtotal = 0;
       for (const item of input.items) {
         subtotal += roundMoney(item.receivedQty * item.unitPrice - (item.discountAmount || 0));
       }
-      const totalAmount = roundMoney(subtotal);
+      const shipping = roundMoney(input.shippingCost || 0);
+      const orderDiscount = roundMoney(input.discountAmount || 0);
+      const totalAmount = roundMoney(Math.max(0, subtotal + shipping - orderDiscount));
       const paid = roundMoney(Math.min(totalAmount, input.paidAmount));
       const remaining = roundMoney(totalAmount - paid);
       const purchaseNumber = `ACH-${new Date().getFullYear()}-${Date.now().toString().slice(-4)}`;
@@ -234,6 +281,8 @@ export const AtelierPostgresRepository = {
           receiptStatus: "RECEIVED",
           paymentStatus: remaining === 0 ? "PAID" : paid > 0 ? "PARTIALLY_PAID" : "UNPAID",
           subtotal: String(subtotal),
+          shippingCost: String(shipping),
+          discountAmount: String(orderDiscount),
           totalAmount: String(totalAmount),
           paidAmount: String(paid),
           remainingAmount: String(remaining),
@@ -246,7 +295,8 @@ export const AtelierPostgresRepository = {
         const [mat] = await tx
           .select()
           .from(schema.materials)
-          .where(eq(schema.materials.id, item.materialId));
+          .where(eq(schema.materials.id, item.materialId))
+          .for("update");
         if (!mat) throw new Error(`Material ${item.materialId} not found`);
 
         const oldOnHand = Number(mat.onHandQty);
@@ -304,31 +354,64 @@ export const AtelierPostgresRepository = {
         })
         .where(eq(schema.suppliers.id, input.supplierId));
 
+      if (paid > 0) {
+        const nextCashBalance = await computeNextCashBalance(tx, "OUT", paid);
+        await tx.insert(schema.cashMovements).values({
+          idempotencyKey: `cash-pur-${input.idempotencyKey}`,
+          movementReference: `TRES-${Date.now().toString().slice(-5)}`,
+          direction: "OUT",
+          category: "SUPPLIER_PAYMENT",
+          amount: String(paid),
+          paymentMethod: input.paymentMethod,
+          balanceAfter: String(nextCashBalance),
+          referenceType: "PURCHASE",
+          referenceId: purchase.id,
+          description: `Règlement achat ${purchaseNumber}`,
+          movementDate: new Date(),
+        });
+      }
+
       return purchase;
     });
   },
-,
+
   async recordSupplierPaymentTransaction(input: {
     idempotencyKey: string;
     supplierId: string;
     purchaseId?: string | null;
     amount: number;
     paymentMethod: string;
-    referenceNumber?: string;
     notes?: string;
   }) {
     return await db.transaction(async (tx) => {
+      const [existingPayment] = await tx
+        .select()
+        .from(schema.supplierPayments)
+        .where(eq(schema.supplierPayments.idempotencyKey, input.idempotencyKey))
+        .limit(1);
+      if (existingPayment) {
+        return existingPayment;
+      }
+
+      const [supplier] = await tx
+        .select()
+        .from(schema.suppliers)
+        .where(eq(schema.suppliers.id, input.supplierId))
+        .for("update");
+      if (!supplier) throw new Error("Supplier not found");
+
       const amt = roundMoney(input.amount);
+      const paymentReference = `PAIE-FOUR-${Date.now().toString().slice(-5)}`;
       const [payment] = await tx
         .insert(schema.supplierPayments)
         .values({
           idempotencyKey: input.idempotencyKey,
-          paymentNumber: `PAIE-FOUR-${Date.now().toString().slice(-5)}`,
+          paymentReference,
           supplierId: input.supplierId,
           purchaseId: input.purchaseId || null,
           amount: String(amt),
           paymentMethod: input.paymentMethod,
-          referenceNumber: input.referenceNumber || "",
+          paymentDate: new Date(),
           notes: input.notes || "",
         })
         .returning();
@@ -342,16 +425,19 @@ export const AtelierPostgresRepository = {
         })
         .where(eq(schema.suppliers.id, input.supplierId));
 
+      const nextCashBalance = await computeNextCashBalance(tx, "OUT", amt);
       await tx.insert(schema.cashMovements).values({
         idempotencyKey: `cash-${input.idempotencyKey}`,
-        movementNumber: `TRES-${Date.now().toString().slice(-5)}`,
+        movementReference: `TRES-${Date.now().toString().slice(-5)}`,
         direction: "OUT",
         category: "SUPPLIER_PAYMENT",
         amount: String(amt),
         paymentMethod: input.paymentMethod,
+        balanceAfter: String(nextCashBalance),
         referenceType: "SUPPLIER_PAYMENT",
         referenceId: payment.id,
         description: input.notes || "Règlement fournisseur / دفعة لمورد",
+        movementDate: new Date(),
       });
 
       return payment;
@@ -363,12 +449,19 @@ export const AtelierPostgresRepository = {
     nameAr: string;
     nameFr: string;
     categoryId: string;
-    laborCost: number;
-    overheadCost: number;
-    TargetPrice: number;
-    sizes: string[];
-    colors: string[];
-    bomItems: Array<{ materialId: string; quantityPerUnit: number; wastagePercent?: number }>;
+    description?: string;
+    availableColors?: string[];
+    availableSizes?: string[];
+    expectedProductionHours?: number;
+    estimatedLaborCost?: number;
+    defaultSellingPrice: number;
+    primaryImageUrl?: string;
+    bomItems: Array<{
+      materialId: string;
+      quantityPerUnit: number;
+      wastagePercent?: number;
+      stageNote?: string;
+    }>;
   }) {
     return await db.transaction(async (tx) => {
       const [model] = await tx
@@ -378,9 +471,13 @@ export const AtelierPostgresRepository = {
           nameAr: input.nameAr,
           nameFr: input.nameFr,
           categoryId: input.categoryId,
-          defaultLaborCost: String(roundMoney(input.laborCost)),
-          defaultOverheadCost: String(roundMoney(input.overheadCost)),
-          suggestedSellingPrice: String(roundMoney(input.TargetPrice)),
+          description: input.description,
+          availableColors: input.availableColors || ["Noir"],
+          availableSizes: input.availableSizes || ["S", "M", "L"],
+          expectedProductionHours: String(roundMoney(input.expectedProductionHours || 8)),
+          estimatedLaborCost: String(roundMoney(input.estimatedLaborCost || 3000)),
+          defaultSellingPrice: String(roundMoney(input.defaultSellingPrice)),
+          primaryImageUrl: input.primaryImageUrl,
         })
         .returning();
 
@@ -388,8 +485,9 @@ export const AtelierPostgresRepository = {
         .insert(schema.billOfMaterials)
         .values({
           modelId: model.id,
-          version: "1.0",
-          isActive: true,
+          version: 1,
+          batchSize: 1,
+          isCurrent: true,
         })
         .returning();
 
@@ -398,7 +496,8 @@ export const AtelierPostgresRepository = {
           bomId: bom.id,
           materialId: item.materialId,
           quantityPerUnit: String(roundQty(item.quantityPerUnit)),
-          wastagePercent: String(roundQty(item.wastagePercent || 0)),
+          wastagePercent: String(roundMoney(item.wastagePercent || 0)),
+          stageNote: item.stageNote,
         });
       }
 
@@ -409,16 +508,30 @@ export const AtelierPostgresRepository = {
   async createProductionOrderTransaction(input: {
     idempotencyKey: string;
     modelId: string;
-    targetQty: number;
-    sizeLabel: string;
-    colorLabel: string;
-    laborCostTotal: number;
-    overheadCostTotal: number;
-    packagingCostTotal?: number;
-    assignedArtisan?: string;
-    dueDateIso?: string;
+    color: string;
+    size: string;
+    requestedQty: number;
+    plannedStartDate: string;
+    expectedCompletionDate: string;
+    assignedNotes?: string;
   }) {
     return await db.transaction(async (tx) => {
+      const [existingOrder] = await tx
+        .select()
+        .from(schema.productionOrders)
+        .where(eq(schema.productionOrders.idempotencyKey, input.idempotencyKey))
+        .limit(1);
+      if (existingOrder) {
+        return existingOrder;
+      }
+
+      const [bom] = await tx
+        .select()
+        .from(schema.billOfMaterials)
+        .where(eq(schema.billOfMaterials.modelId, input.modelId))
+        .limit(1);
+      if (!bom) throw new Error("Active Bill of Materials (BOM) not found for model");
+
       const orderNumber = `OF-${new Date().getFullYear()}-${Date.now().toString().slice(-4)}`;
       const [order] = await tx
         .insert(schema.productionOrders)
@@ -426,16 +539,15 @@ export const AtelierPostgresRepository = {
           idempotencyKey: input.idempotencyKey,
           orderNumber,
           modelId: input.modelId,
-          targetQty: input.targetQty,
-          sizeLabel: input.sizeLabel,
-          colorLabel: input.colorLabel,
-          status: "IN_PROGRESS",
+          bomId: bom.id,
+          color: input.color,
+          size: input.size,
+          requestedQty: input.requestedQty,
+          status: "CUTTING",
           currentStageCode: "CUTTING",
-          laborCostTotal: String(roundMoney(input.laborCostTotal)),
-          overheadCostTotal: String(roundMoney(input.overheadCostTotal)),
-          packagingCostTotal: String(roundMoney(input.packagingCostTotal || 0)),
-          assignedArtisan: input.assignedArtisan || "",
-          dueDate: input.dueDateIso ? new Date(input.dueDateIso) : new Date(),
+          plannedStartDate: new Date(input.plannedStartDate),
+          expectedCompletionDate: new Date(input.expectedCompletionDate),
+          assignedNotes: input.assignedNotes || "",
         })
         .returning();
       return order;
@@ -445,42 +557,66 @@ export const AtelierPostgresRepository = {
   async completeProductionOrderTransaction(input: {
     idempotencyKey: string;
     productionOrderId: string;
-    completedQty: number;
+    producedQty: number;
     acceptedQty: number;
     rejectedQty: number;
-    sellingPriceUnit: number;
-    qcInspector?: string;
+    wastePercent?: number;
+    directLaborCost?: number;
     qcNotes?: string;
   }) {
     return await db.transaction(async (tx) => {
+      const [existingMovement] = await tx
+        .select()
+        .from(schema.finishedStockMovements)
+        .where(eq(schema.finishedStockMovements.idempotencyKey, input.idempotencyKey))
+        .limit(1);
+      if (existingMovement) {
+        return {
+          orderId: input.productionOrderId,
+          finishedMovement: existingMovement,
+          idempotentReplay: true,
+        };
+      }
+
       const [order] = await tx
         .select()
         .from(schema.productionOrders)
-        .where(eq(schema.productionOrders.id, input.productionOrderId));
+        .where(eq(schema.productionOrders.id, input.productionOrderId))
+        .for("update");
       if (!order) throw new Error("Production order not found");
-      if (input.acceptedQty + input.rejectedQty !== input.completedQty) {
-        throw new Error("Accepted + Rejected units must equal Completed units");
+      if (order.status === "COMPLETED" || order.stockCompleted) {
+        throw new Error("Production order has already been completed");
+      }
+      if (input.acceptedQty + input.rejectedQty !== input.producedQty) {
+        throw new Error("Accepted + Rejected units must equal Produced units");
       }
 
-      const totalOrderCost = roundMoney(
-        Number(order.materialCostTotal || 0) +
-          Number(order.laborCostTotal || 0) +
-          Number(order.overheadCostTotal || 0) +
-          Number(order.packagingCostTotal || 0)
+      const [model] = await tx
+        .select()
+        .from(schema.models)
+        .where(eq(schema.models.id, order.modelId))
+        .limit(1);
+      if (!model) throw new Error("Associated model not found");
+
+      const laborCost = roundMoney(
+        input.directLaborCost !== undefined ? input.directLaborCost : Number(order.directLaborCost || model.estimatedLaborCost || 0)
       );
-      const unitProductionCost =
-        input.acceptedQty > 0 ? roundMoney(totalOrderCost / input.acceptedQty) : 0;
+      const actualTotalCost = roundMoney(Number(order.actualMaterialCost || order.estimatedMaterialCost || 0) + laborCost);
+      const actualUnitCost =
+        input.acceptedQty > 0 ? roundMoney(actualTotalCost / input.acceptedQty) : 0;
 
       await tx
         .update(schema.productionOrders)
         .set({
-          completedQty: input.completedQty,
+          producedQty: input.producedQty,
           acceptedQty: input.acceptedQty,
           rejectedQty: input.rejectedQty,
           status: "COMPLETED",
           currentStageCode: "COMPLETED",
-          totalOrderCost: String(totalOrderCost),
-          unitProductionCost: String(unitProductionCost),
+          stockCompleted: true,
+          directLaborCost: String(laborCost),
+          actualTotalCost: String(actualTotalCost),
+          actualUnitCost: String(actualUnitCost),
           completedAt: new Date(),
           updatedAt: new Date(),
         })
@@ -488,56 +624,93 @@ export const AtelierPostgresRepository = {
 
       await tx.insert(schema.qualityChecks).values({
         productionOrderId: order.id,
-        inspectedQty: input.completedQty,
+        inspectedQty: input.producedQty,
         acceptedQty: input.acceptedQty,
         rejectedQty: input.rejectedQty,
-        inspectorName: input.qcInspector || "Atelier QC",
+        result: input.rejectedQty === 0 ? "ACCEPTED" : "NEEDS_REWORK",
         notes: input.qcNotes || "",
       });
 
       const [fp] = await tx
         .insert(schema.finishedProducts)
         .values({
-          sku: `PF-${order.orderNumber}-${order.sizeLabel}`,
+          sku: `PF-${order.orderNumber}-${order.size}`,
           modelId: order.modelId,
-          productionOrderId: order.id,
-          nameAr: `منتج جاهز ${order.orderNumber}`,
-          nameFr: `Produit Fini ${order.orderNumber}`,
-          sizeLabel: order.sizeLabel,
-          colorLabel: order.colorLabel,
+          categoryId: model.categoryId,
+          nameAr: `${model.nameAr} (${order.orderNumber})`,
+          nameFr: `${model.nameFr} (${order.orderNumber})`,
+          color: order.color,
+          size: order.size,
           onHandQty: input.acceptedQty,
           availableQty: input.acceptedQty,
-          unitCost: String(unitProductionCost),
-          sellingPrice: String(roundMoney(input.sellingPriceUnit)),
+          unitProductionCost: String(actualUnitCost),
+          sellingPrice: String(model.defaultSellingPrice),
         })
         .returning();
 
-      return { orderId: order.id, finishedProduct: fp, unitProductionCost };
+      await tx.insert(schema.finishedStockMovements).values({
+        idempotencyKey: input.idempotencyKey,
+        finishedProductId: fp.id,
+        movementType: "PRODUCTION_COMPLETION",
+        direction: "IN",
+        quantity: input.acceptedQty,
+        unitCost: String(actualUnitCost),
+        balanceAfter: input.acceptedQty,
+        referenceType: "PRODUCTION_ORDER",
+        referenceId: order.orderNumber,
+        reason: `Production order ${order.orderNumber} completed`,
+      });
+
+      return { orderId: order.id, finishedProduct: fp, unitProductionCost: actualUnitCost };
     });
   },
 
   async completeSaleCheckoutTransaction(input: {
     idempotencyKey: string;
-    customerId?: string | null;
-    discountAmount?: number;
-    taxPercent?: number;
-    initialPaymentAmount?: number;
-    paymentMethod?: string;
-    dueDateIso?: string;
-    notes?: string;
+    customerId: string;
     items: Array<{
       finishedProductId: string;
       quantity: number;
-      unitPrice: number;
       lineDiscount?: number;
     }>;
+    orderDiscountAmount?: number;
+    amountReceived?: number;
+    paymentMethod: string;
+    dueDate: string;
+    notes?: string;
   }) {
     return await db.transaction(async (tx) => {
+      const [existingSale] = await tx
+        .select()
+        .from(schema.sales)
+        .where(eq(schema.sales.idempotencyKey, input.idempotencyKey))
+        .limit(1);
+      if (existingSale) {
+        const [existingInvoice] = await tx
+          .select()
+          .from(schema.invoices)
+          .where(eq(schema.invoices.saleId, existingSale.id))
+          .limit(1);
+        return { sale: existingSale, invoice: existingInvoice, idempotentReplay: true };
+      }
+
+      const [customer] = await tx
+        .select()
+        .from(schema.customers)
+        .where(eq(schema.customers.id, input.customerId))
+        .for("update");
+      if (!customer) throw new Error("Customer not found");
+
+      const [workshop] = await tx.select().from(schema.workshopSettings).limit(1);
+
       let subtotal = 0;
+      let lineDiscountTotal = 0;
+      let totalCogs = 0;
       const lineSnapshots: Array<{
         fp: typeof schema.finishedProducts.$inferSelect;
         qty: number;
         unitPrice: number;
+        unitCost: number;
         lineDiscount: number;
         lineTotal: number;
       }> = [];
@@ -546,32 +719,41 @@ export const AtelierPostgresRepository = {
         const [fp] = await tx
           .select()
           .from(schema.finishedProducts)
-          .where(eq(schema.finishedProducts.id, item.finishedProductId));
+          .where(eq(schema.finishedProducts.id, item.finishedProductId))
+          .for("update");
         if (!fp) throw new Error(`Finished product ${item.finishedProductId} not found`);
         if (fp.availableQty < item.quantity) {
           throw new Error(`Insufficient finished stock for ${fp.sku} (available: ${fp.availableQty})`);
         }
-        const lineTotal = roundMoney(item.quantity * item.unitPrice - (item.lineDiscount || 0));
-        subtotal += lineTotal;
+        const unitPrice = roundMoney(Number(fp.sellingPrice));
+        const unitCost = roundMoney(Number(fp.unitProductionCost));
+        const lineDiscount = roundMoney(item.lineDiscount || 0);
+        const lineTotal = roundMoney(Math.max(0, item.quantity * unitPrice - lineDiscount));
+        subtotal = roundMoney(subtotal + item.quantity * unitPrice);
+        lineDiscountTotal = roundMoney(lineDiscountTotal + lineDiscount);
+        totalCogs = roundMoney(totalCogs + item.quantity * unitCost);
         lineSnapshots.push({
           fp,
           qty: item.quantity,
-          unitPrice: roundMoney(item.unitPrice),
-          lineDiscount: roundMoney(item.lineDiscount || 0),
+          unitPrice,
+          unitCost,
+          lineDiscount,
           lineTotal,
         });
       }
 
-      const discount = roundMoney(input.discountAmount || 0);
-      const taxable = Math.max(0, subtotal - discount);
-      const taxAmount = roundMoney(taxable * ((input.taxPercent || 0) / 100));
+      const orderDiscount = roundMoney(input.orderDiscountAmount || 0);
+      const discountTotal = roundMoney(lineDiscountTotal + orderDiscount);
+      const taxable = Math.max(0, subtotal - discountTotal);
+      const taxRate = workshop?.taxEnabled ? Number(workshop.defaultTaxRate || 0) : 0;
+      const taxAmount = roundMoney(taxable * (taxRate / 100));
       const totalAmount = roundMoney(taxable + taxAmount);
-      const paidAmount = roundMoney(Math.min(totalAmount, input.initialPaymentAmount || 0));
+      const paidAmount = roundMoney(Math.min(totalAmount, input.amountReceived || 0));
       const statusCalc = calculateInvoicePaymentStatus({
         totalAmount,
         paidAmount,
         refundedAmount: 0,
-        dueDateIso: input.dueDateIso || getAlgiersCurrentDateIso(),
+        dueDateIso: input.dueDate || getAlgiersCurrentDateIso(),
       });
 
       const saleNumber = `VTE-${new Date().getFullYear()}-${Date.now().toString().slice(-4)}`;
@@ -582,12 +764,15 @@ export const AtelierPostgresRepository = {
         .values({
           idempotencyKey: input.idempotencyKey,
           saleNumber,
-          customerId: input.customerId || null,
-          status: "COMPLETED",
+          customerId: customer.id,
+          saleDate: new Date(),
+          status: "CONFIRMED",
           subtotal: String(subtotal),
-          discountAmount: String(discount),
+          lineDiscountTotal: String(lineDiscountTotal),
+          orderDiscountAmount: String(orderDiscount),
           taxAmount: String(taxAmount),
           totalAmount: String(totalAmount),
+          totalCogs: String(totalCogs),
           notes: input.notes || "",
         })
         .returning();
@@ -595,63 +780,131 @@ export const AtelierPostgresRepository = {
       const [invoice] = await tx
         .insert(schema.invoices)
         .values({
-          idempotencyKey: `inv-${input.idempotencyKey}`,
           invoiceNumber,
           saleId: sale.id,
-          customerId: input.customerId || null,
+          customerId: customer.id,
           documentStatus: "ISSUED",
           paymentStatus: statusCalc.paymentStatus,
           issueDate: new Date(),
-          dueDate: input.dueDateIso ? new Date(input.dueDateIso) : new Date(),
+          dueDate: input.dueDate ? new Date(input.dueDate) : new Date(),
+          workshopSnapshotJson: workshop || { nameFr: "Maison AFAF EL ASSLI" },
+          customerSnapshotJson: {
+            id: customer.id,
+            fullName: customer.fullName,
+            phone: customer.phone,
+            wilaya: customer.wilaya,
+          },
           subtotal: String(subtotal),
-          discountAmount: String(discount),
-          taxPercent: String(input.taxPercent || 0),
+          discountTotal: String(discountTotal),
           taxAmount: String(taxAmount),
           totalAmount: String(totalAmount),
           paidAmount: String(paidAmount),
           refundedAmount: "0.00",
+          netPaidAmount: String(statusCalc.netPaidAmount),
           remainingBalance: String(statusCalc.remainingBalance),
           notes: input.notes || "",
         })
         .returning();
 
-      for (const snap of lineSnapshots) {
-        const nextQty = snap.fp.onHandQty - snap.qty;
+      for (let idx = 0; idx < lineSnapshots.length; idx++) {
+        const snap = lineSnapshots[idx];
+        const nextOnHand = snap.fp.onHandQty - snap.qty;
+        const nextAvail = Math.max(0, snap.fp.availableQty - snap.qty);
+
         await tx
           .update(schema.finishedProducts)
           .set({
-            onHandQty: nextQty,
-            availableQty: Math.max(0, snap.fp.availableQty - snap.qty),
+            onHandQty: nextOnHand,
+            availableQty: nextAvail,
+            status: nextAvail === 0 ? "OUT_OF_STOCK" : nextAvail <= snap.fp.minStockThreshold ? "LOW_STOCK" : "AVAILABLE",
             updatedAt: new Date(),
           })
           .where(eq(schema.finishedProducts.id, snap.fp.id));
 
-        await tx.insert(schema.invoiceItems).values({
-          invoiceId: invoice.id,
+        await tx.insert(schema.saleItems).values({
+          saleId: sale.id,
           finishedProductId: snap.fp.id,
-          snapshotSku: snap.fp.sku,
-          snapshotNameAr: snap.fp.nameAr,
-          snapshotNameFr: snap.fp.nameFr,
-          snapshotSize: snap.fp.sizeLabel,
-          snapshotColor: snap.fp.colorLabel,
+          productSkuSnapshot: snap.fp.sku,
+          productNameArSnapshot: snap.fp.nameAr,
+          productNameFrSnapshot: snap.fp.nameFr,
+          colorSnapshot: snap.fp.color,
+          sizeSnapshot: snap.fp.size,
           quantity: snap.qty,
           unitPrice: String(snap.unitPrice),
-          unitCostSnapshot: String(snap.fp.unitCost),
-          discountAmount: String(snap.lineDiscount),
+          unitCostSnapshot: String(snap.unitCost),
+          lineDiscount: String(snap.lineDiscount),
           lineTotal: String(snap.lineTotal),
+        });
+
+        await tx.insert(schema.invoiceItems).values({
+          invoiceId: invoice.id,
+          lineNumber: idx + 1,
+          skuSnapshot: snap.fp.sku,
+          descriptionArSnapshot: snap.fp.nameAr,
+          descriptionFrSnapshot: snap.fp.nameFr,
+          colorSnapshot: snap.fp.color,
+          sizeSnapshot: snap.fp.size,
+          quantity: snap.qty,
+          unitPrice: String(snap.unitPrice),
+          lineDiscount: String(snap.lineDiscount),
+          lineTotal: String(snap.lineTotal),
+        });
+
+        await tx.insert(schema.finishedStockMovements).values({
+          idempotencyKey: `${input.idempotencyKey}-sale-fp-${snap.fp.id}-${idx}`,
+          finishedProductId: snap.fp.id,
+          movementType: "SALE_DISPATCH",
+          direction: "OUT",
+          quantity: snap.qty,
+          unitCost: String(snap.unitCost),
+          balanceAfter: nextOnHand,
+          referenceType: "SALE",
+          referenceId: saleNumber,
+          reason: `POS sale ${saleNumber}`,
         });
       }
 
       if (paidAmount > 0) {
-        await tx.insert(schema.payments).values({
-          idempotencyKey: `pay-${input.idempotencyKey}`,
-          paymentNumber: `REG-${Date.now().toString().slice(-5)}`,
-          invoiceId: invoice.id,
-          customerId: input.customerId || null,
+        const paymentReference = `REG-${Date.now().toString().slice(-5)}`;
+        const [payment] = await tx
+          .insert(schema.payments)
+          .values({
+            idempotencyKey: `pay-${input.idempotencyKey}`,
+            paymentReference,
+            invoiceId: invoice.id,
+            customerId: customer.id,
+            amount: String(paidAmount),
+            paymentMethod: input.paymentMethod || "CASH",
+            paymentDate: new Date(),
+          })
+          .returning();
+
+        const nextCashBalance = await computeNextCashBalance(tx, "IN", paidAmount);
+        await tx.insert(schema.cashMovements).values({
+          idempotencyKey: `cash-sale-${input.idempotencyKey}`,
+          movementReference: `TRES-${Date.now().toString().slice(-5)}`,
+          direction: "IN",
+          category: "CUSTOMER_PAYMENT",
           amount: String(paidAmount),
           paymentMethod: input.paymentMethod || "CASH",
+          balanceAfter: String(nextCashBalance),
+          referenceType: "PAYMENT",
+          referenceId: payment.id,
+          description: `Encaissement vente ${saleNumber}`,
+          movementDate: new Date(),
         });
       }
+
+      await tx
+        .update(schema.customers)
+        .set({
+          totalPurchases: sql`${schema.customers.totalPurchases} + ${totalAmount}`,
+          totalPaid: sql`${schema.customers.totalPaid} + ${paidAmount}`,
+          outstandingBalance: sql`${schema.customers.outstandingBalance} + ${statusCalc.remainingBalance}`,
+          lastPurchaseAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .where(eq(schema.customers.id, customer.id));
 
       return { sale, invoice };
     });
@@ -662,17 +915,38 @@ export const AtelierPostgresRepository = {
     invoiceId: string;
     amount: number;
     paymentMethod: string;
-    referenceNumber?: string;
+    paymentDate?: string;
+    externalRef?: string;
     notes?: string;
   }) {
     return await db.transaction(async (tx) => {
+      const [existingPayment] = await tx
+        .select()
+        .from(schema.payments)
+        .where(eq(schema.payments.idempotencyKey, input.idempotencyKey))
+        .limit(1);
+      if (existingPayment) {
+        const [inv] = await tx
+          .select()
+          .from(schema.invoices)
+          .where(eq(schema.invoices.id, existingPayment.invoiceId))
+          .limit(1);
+        return { payment: existingPayment, invoice: inv, idempotentReplay: true };
+      }
+
       const [inv] = await tx
         .select()
         .from(schema.invoices)
-        .where(eq(schema.invoices.id, input.invoiceId));
+        .where(eq(schema.invoices.id, input.invoiceId))
+        .for("update");
       if (!inv) throw new Error("Invoice not found");
 
-      const nextPaid = roundMoney(Number(inv.paidAmount) + input.amount);
+      const amt = roundMoney(input.amount);
+      if (amt > Number(inv.remainingBalance)) {
+        throw new Error("Payment amount cannot exceed invoice remaining balance");
+      }
+
+      const nextPaid = roundMoney(Number(inv.paidAmount) + amt);
       const statusCalc = calculateInvoicePaymentStatus({
         totalAmount: Number(inv.totalAmount),
         paidAmount: nextPaid,
@@ -684,12 +958,13 @@ export const AtelierPostgresRepository = {
         .insert(schema.payments)
         .values({
           idempotencyKey: input.idempotencyKey,
-          paymentNumber: `REG-${Date.now().toString().slice(-5)}`,
+          paymentReference: `REG-${Date.now().toString().slice(-5)}`,
           invoiceId: inv.id,
           customerId: inv.customerId,
-          amount: String(roundMoney(input.amount)),
+          amount: String(amt),
           paymentMethod: input.paymentMethod,
-          referenceNumber: input.referenceNumber || "",
+          paymentDate: input.paymentDate ? new Date(input.paymentDate) : new Date(),
+          externalRef: input.externalRef || "",
           notes: input.notes || "",
         })
         .returning();
@@ -698,12 +973,37 @@ export const AtelierPostgresRepository = {
         .update(schema.invoices)
         .set({
           paidAmount: String(nextPaid),
+          netPaidAmount: String(statusCalc.netPaidAmount),
           remainingBalance: String(statusCalc.remainingBalance),
           paymentStatus: statusCalc.paymentStatus,
           updatedAt: new Date(),
         })
         .where(eq(schema.invoices.id, inv.id))
         .returning();
+
+      await tx
+        .update(schema.customers)
+        .set({
+          totalPaid: sql`${schema.customers.totalPaid} + ${amt}`,
+          outstandingBalance: sql`GREATEST(0, ${schema.customers.outstandingBalance} - ${amt})`,
+          updatedAt: new Date(),
+        })
+        .where(eq(schema.customers.id, inv.customerId));
+
+      const nextCashBalance = await computeNextCashBalance(tx, "IN", amt);
+      await tx.insert(schema.cashMovements).values({
+        idempotencyKey: `cash-pay-${input.idempotencyKey}`,
+        movementReference: `TRES-${Date.now().toString().slice(-5)}`,
+        direction: "IN",
+        category: "CUSTOMER_PAYMENT",
+        amount: String(amt),
+        paymentMethod: input.paymentMethod,
+        balanceAfter: String(nextCashBalance),
+        referenceType: "PAYMENT",
+        referenceId: payment.id,
+        description: input.notes || `Règlement facture ${inv.invoiceNumber}`,
+        movementDate: new Date(),
+      });
 
       return { payment, invoice: updatedInvoice };
     });
@@ -712,19 +1012,38 @@ export const AtelierPostgresRepository = {
   async processRefundTransaction(input: {
     idempotencyKey: string;
     invoiceId: string;
+    finishedProductId?: string;
+    returnedQuantity?: number;
+    returnCondition?: "RESTOCK" | "QUARANTINE_DAMAGED" | "NO_PHYSICAL_RETURN";
     amount: number;
-    paymentMethod: string;
+    refundMethod: string;
     reason: string;
-    restockItems?: Array<{ finishedProductId: string; quantity: number }>;
+    refundDate?: string;
   }) {
     return await db.transaction(async (tx) => {
+      const [existingRefund] = await tx
+        .select()
+        .from(schema.refunds)
+        .where(eq(schema.refunds.idempotencyKey, input.idempotencyKey))
+        .limit(1);
+      if (existingRefund) {
+        const [inv] = await tx
+          .select()
+          .from(schema.invoices)
+          .where(eq(schema.invoices.id, existingRefund.invoiceId))
+          .limit(1);
+        return { refund: existingRefund, invoice: inv, idempotentReplay: true };
+      }
+
       const [inv] = await tx
         .select()
         .from(schema.invoices)
-        .where(eq(schema.invoices.id, input.invoiceId));
+        .where(eq(schema.invoices.id, input.invoiceId))
+        .for("update");
       if (!inv) throw new Error("Invoice not found");
 
-      const nextRefunded = roundMoney(Number(inv.refundedAmount) + input.amount);
+      const amt = roundMoney(input.amount);
+      const nextRefunded = roundMoney(Number(inv.refundedAmount) + amt);
       if (nextRefunded > Number(inv.paidAmount)) {
         throw new Error("Refund amount cannot exceed total paid amount");
       }
@@ -736,30 +1055,88 @@ export const AtelierPostgresRepository = {
         dueDateIso: inv.dueDate ? inv.dueDate.toISOString().slice(0, 10) : getAlgiersCurrentDateIso(),
       });
 
+      const refundReference = `AVO-${Date.now().toString().slice(-5)}`;
+      const returnedQty = input.returnedQuantity || 0;
+      const returnCondition = input.returnCondition || "RESTOCK";
+
       const [refund] = await tx
         .insert(schema.refunds)
         .values({
           idempotencyKey: input.idempotencyKey,
-          refundNumber: `AVO-${Date.now().toString().slice(-5)}`,
+          refundReference,
+          saleId: inv.saleId,
           invoiceId: inv.id,
           customerId: inv.customerId,
-          amount: String(roundMoney(input.amount)),
-          refundMethod: input.paymentMethod,
+          finishedProductId: input.finishedProductId || null,
+          returnedQuantity: returnedQty,
+          returnCondition,
+          amount: String(amt),
+          refundMethod: input.refundMethod,
           reason: input.reason,
-          restockedToInventory: Boolean(input.restockItems && input.restockItems.length > 0),
+          refundDate: input.refundDate ? new Date(input.refundDate) : new Date(),
         })
         .returning();
+
+      if (returnCondition === "RESTOCK" && returnedQty > 0 && input.finishedProductId) {
+        const [fp] = await tx
+          .select()
+          .from(schema.finishedProducts)
+          .where(eq(schema.finishedProducts.id, input.finishedProductId))
+          .for("update");
+        if (fp) {
+          const nextOnHand = fp.onHandQty + returnedQty;
+          const nextAvail = fp.availableQty + returnedQty;
+          await tx
+            .update(schema.finishedProducts)
+            .set({
+              onHandQty: nextOnHand,
+              availableQty: nextAvail,
+              status: "AVAILABLE",
+              updatedAt: new Date(),
+            })
+            .where(eq(schema.finishedProducts.id, fp.id));
+
+          await tx.insert(schema.finishedStockMovements).values({
+            idempotencyKey: `restock-${input.idempotencyKey}`,
+            finishedProductId: fp.id,
+            movementType: "CUSTOMER_RETURN_RESTOCK",
+            direction: "IN",
+            quantity: returnedQty,
+            unitCost: String(fp.unitProductionCost),
+            balanceAfter: nextOnHand,
+            referenceType: "REFUND",
+            referenceId: refundReference,
+            reason: input.reason,
+          });
+        }
+      }
 
       const [updatedInvoice] = await tx
         .update(schema.invoices)
         .set({
           refundedAmount: String(nextRefunded),
+          netPaidAmount: String(statusCalc.netPaidAmount),
           remainingBalance: String(statusCalc.remainingBalance),
           paymentStatus: statusCalc.paymentStatus,
           updatedAt: new Date(),
         })
         .where(eq(schema.invoices.id, inv.id))
         .returning();
+
+      const nextCashBalance = await computeNextCashBalance(tx, "OUT", amt);
+      await tx.insert(schema.cashMovements).values({
+        idempotencyKey: `cash-ref-${input.idempotencyKey}`,
+        movementReference: `TRES-${Date.now().toString().slice(-5)}`,
+        direction: "OUT",
+        category: "CUSTOMER_REFUND",
+        amount: String(amt),
+        paymentMethod: input.refundMethod,
+        balanceAfter: String(nextCashBalance),
+        referenceType: "REFUND",
+        referenceId: refund.id,
+        description: `Remboursement client ${refundReference}: ${input.reason}`,
+        movementDate: new Date(),
+      });
 
       return { refund, invoice: updatedInvoice };
     });

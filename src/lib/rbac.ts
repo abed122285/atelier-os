@@ -1,33 +1,4 @@
-export type PermissionCode =
-  | "dashboard.view"
-  | "models.view"
-  | "models.create"
-  | "models.edit"
-  | "models.delete"
-  | "inventory.view"
-  | "inventory.adjust"
-  | "purchases.view"
-  | "purchases.create"
-  | "production.view"
-  | "production.create"
-  | "production.assign"
-  | "production.update"
-  | "sales.view"
-  | "sales.create"
-  | "sales.edit"
-  | "sales.cancel"
-  | "invoices.view"
-  | "invoices.create"
-  | "customers.view"
-  | "customers.create"
-  | "customers.edit"
-  | "finance.view"
-  | "finance.create_expense"
-  | "reports.view"
-  | "employees.manage"
-  | "settings.manage";
-
-export const ALL_PERMISSIONS: PermissionCode[] = [
+export const ALL_PERMISSIONS = [
   "dashboard.view",
   "models.view",
   "models.create",
@@ -55,7 +26,18 @@ export const ALL_PERMISSIONS: PermissionCode[] = [
   "reports.view",
   "employees.manage",
   "settings.manage",
-];
+] as const;
+
+export type PermissionCode = (typeof ALL_PERMISSIONS)[number];
+
+export const ASSIGNABLE_EMPLOYEE_ROLES = [
+  "PRODUCTION_MANAGER",
+  "SALES_CASHIER",
+  "INVENTORY_PURCHASING",
+  "ACCOUNTANT_FINANCE",
+] as const;
+
+export type AssignableEmployeeRoleCode = (typeof ASSIGNABLE_EMPLOYEE_ROLES)[number];
 
 export const ROLE_PERMISSION_PRESETS: Record<string, PermissionCode[]> = {
   OWNER_ADMIN: [...ALL_PERMISSIONS],
@@ -114,6 +96,10 @@ export interface AtelierSessionUser {
   customDeny?: PermissionCode[];
 }
 
+export function isPermissionCode(value: string): value is PermissionCode {
+  return (ALL_PERMISSIONS as readonly string[]).includes(value);
+}
+
 export function evaluateUserPermission(
   user: AtelierSessionUser | null | undefined,
   requiredPermission: PermissionCode
@@ -123,4 +109,11 @@ export function evaluateUserPermission(
   if (user.customDeny?.includes(requiredPermission)) return false;
   if (user.customGrant?.includes(requiredPermission)) return true;
   return user.permissions.includes(requiredPermission);
+}
+
+export function evaluateAnyUserPermission(
+  user: AtelierSessionUser | null | undefined,
+  requiredPermissions: readonly PermissionCode[]
+): boolean {
+  return requiredPermissions.some((perm) => evaluateUserPermission(user, perm));
 }
