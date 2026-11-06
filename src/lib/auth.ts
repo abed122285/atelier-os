@@ -259,9 +259,7 @@ export async function requirePermission(
     };
   }
 
-  const requiredList = Array.isArray(requiredPermission)
-    ? requiredPermission
-    : [requiredPermission];
+  const requiredList = typeof requiredPermission === "string" ? [requiredPermission] : requiredPermission;
 
   if (!evaluateAnyUserPermission(authResult.user, requiredList)) {
     return {

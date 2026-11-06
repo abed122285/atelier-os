@@ -145,7 +145,7 @@ export async function POST(req: NextRequest) {
 
       // Primary check: Supabase Auth native MFA TOTP factor challengeAndVerify
       const { data: factorsData } = await supabase.auth.mfa.listFactors();
-      const verifiedTotpFactor = factorsData?.totp?.find((f) => f.status === "verified");
+      const verifiedTotpFactor = factorsData?.totp?.find((f: any) => f.status === "verified");
       if (verifiedTotpFactor) {
         const { error: mfaErr } = await supabase.auth.mfa.challengeAndVerify({
           factorId: verifiedTotpFactor.id,
