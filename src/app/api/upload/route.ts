@@ -22,9 +22,9 @@ const ENTITY_UPLOAD_PERMISSION: Record<string, PermissionCode> = {
   SETTINGS: "settings.manage",
 };
 
-export { verifyImageMagicBytes };
+export const dynamic = "force-dynamic";
 
-export function sanitizeEntityName(raw: string): string {
+function sanitizeEntityName(raw: string): string {
   return raw.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 48) || "MATERIAL";
 }
 

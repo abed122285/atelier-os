@@ -214,7 +214,7 @@ export async function getAuthenticatedSessionUser(
       organizationId: profile.organization_id,
       username: profile.username,
       fullName: profile.full_name,
-      accountType: profile.account_type,
+      accountType: profile.account_type === "OWNER" ? "OWNER" : "EMPLOYEE",
       roleCode,
       isActive: profile.is_active,
       mfaEnabled: profile.mfa_enabled,

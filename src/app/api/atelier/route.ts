@@ -44,7 +44,8 @@ import {
  * Complete server-side mapping of all Atelier OS actions to the 27-permission RBAC model.
  * Any action not present in this map is rejected fail-closed.
  */
-export const ACTION_REQUIRED_PERMISSION: Record<string, PermissionCode> = {
+export const dynamic = "force-dynamic";
+const ACTION_REQUIRED_PERMISSION: Record<string, PermissionCode> = {
   CALCULATE_PAYMENT_STATUS: "invoices.view",
   CALCULATE_CMP: "inventory.view",
   ADD_MATERIAL: "inventory.adjust",
